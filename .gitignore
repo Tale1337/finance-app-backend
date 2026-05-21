@@ -1,0 +1,19 @@
+# Игнорируем базу данных
+database.sqlite
+*.db
+*.sqlite3
+*.txt
+*.xlsx
+
+# Игнорируем кэш питона
+__pycache__/
+*.py[cod]
+
+# Игнорируем виртуальное окружение
+venv/
+env/
+.venv/
+
+# Игнорируем системные файлы Windows/Mac
+.DS_Store
+Thumbs.db
