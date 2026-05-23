@@ -1,8 +1,9 @@
 database.sqlite
 *.db
 *.sqlite3
-*.txt
 *.xlsx
+*.txt
+!requirements.txt
 
 __pycache__/
 *.py[cod]
