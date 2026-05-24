@@ -1,6 +1,6 @@
 import os
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, ForeignKey, Date, JSON
 from sqlalchemy.orm import declarative_base, sessionmaker
 
@@ -102,7 +102,7 @@ class Transaction(Base):
     description = Column(String, nullable=True)
     is_planned = Column(Boolean, default=False)
     is_recurring = Column(Boolean, default=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     hash = Column(String, unique=True, index=True, nullable=True)
 
 

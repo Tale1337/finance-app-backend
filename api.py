@@ -7,6 +7,7 @@ from database import SessionLocal, init_db, User, Category, Account, Transaction
 from datetime import date
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
 from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy import func, case, or_
 from typing import List
@@ -18,8 +19,14 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="MyFinance API (Prototype)", lifespan=lifespan)
-
+app = FastAPI(title="ProFinance API (Prototype)", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 def get_db():
     db = SessionLocal()
@@ -57,7 +64,7 @@ def create_category(category: schemas.CategoryCreate, db: Session = Depends(get_
         max_sort = db.query(func.max(Category.sort_order)).filter(Category.user_id == category.user_id).scalar() or 0
         category.sort_order = max_sort + 1
 
-    new_category = Category(**category.dict())
+    new_category = Category(**category.model_dump())
     db.add(new_category)
     db.commit()
     db.refresh(new_category)
@@ -71,7 +78,7 @@ def get_accounts(user_id: int, db: Session = Depends(get_db)):
 
 @app.post("/accounts", response_model=schemas.AccountResponse, tags=["Счета"])
 def create_account(account: schemas.AccountCreate, db: Session = Depends(get_db)):
-    new_account = Account(**account.dict())
+    new_account = Account(**account.model_dump())
     new_account.initial_balance = account.balance
     db.add(new_account)
     db.commit()
@@ -86,7 +93,7 @@ def get_transactions(user_id: int, db: Session = Depends(get_db)):
 
 @app.post("/transactions", response_model=schemas.TransactionResponse, tags=["Транзакции"])
 def create_transaction(tx: schemas.TransactionCreate, db: Session = Depends(get_db)):
-    new_tx = Transaction(**tx.dict())
+    new_tx = Transaction(**tx.model_dump())
     db.add(new_tx)
 
     if not tx.is_planned:
@@ -208,11 +215,8 @@ def get_dashboard_data(
             weekly_totals[w]["total_expense"] += row.fact_exp
 
     sorted_weeks = sorted(weekly_totals.keys())
-
     current_running_balance = starting_balance
-    sorted_weeks = sorted(weekly_totals.keys())
 
-    current_running_balance = starting_balance
     for w in sorted_weeks:
         inc = weekly_totals[w]["total_income"]
         exp = weekly_totals[w]["total_expense"]

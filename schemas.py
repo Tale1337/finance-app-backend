@@ -25,6 +25,11 @@ class CategoryResponse(BaseModel):
     user_id: int
     name: str
     type: str
+    icon: Optional[str] = None
+    color: Optional[str] = None
+    budget_limit: Optional[float] = None
+    sort_order: Optional[int] = None
+
     class Config:
         from_attributes = True
 
