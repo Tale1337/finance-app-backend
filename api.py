@@ -87,22 +87,24 @@ def create_account(account: schemas.AccountCreate, db: Session = Depends(get_db)
 
 
 @app.get("/transactions", response_model=List[schemas.TransactionResponse], tags=["Транзакции"])
-def get_transactions(user_id: int, db: Session = Depends(get_db)):
-    return db.query(Transaction).filter(Transaction.user_id == user_id).all()
+def get_transactions(user_id: int, limit: int = 50, offset: int = 0, db: Session = Depends(get_db)):
+    return db.query(Transaction).filter(Transaction.user_id == user_id).offset(offset).limit(limit).all()
 
 
 @app.post("/transactions", response_model=schemas.TransactionResponse, tags=["Транзакции"])
 def create_transaction(tx: schemas.TransactionCreate, db: Session = Depends(get_db)):
+    account = db.query(Account).filter(Account.account_id == tx.account_id).first()
+    if not account:
+        raise HTTPException(status_code=404, detail="Счет не найден")
+
     new_tx = Transaction(**tx.model_dump())
     db.add(new_tx)
 
     if not tx.is_planned:
-        account = db.query(Account).filter(Account.account_id == tx.account_id).first()
-        if account:
-            if tx.type == "expense":
-                account.balance -= tx.amount
-            elif tx.type == "income":
-                account.balance += tx.amount
+        if tx.type == "expense":
+            account.balance -= tx.amount
+        elif tx.type == "income":
+            account.balance += tx.amount
 
     db.commit()
     db.refresh(new_tx)
@@ -146,14 +148,14 @@ def get_dashboard_data(
         Transaction.user_id == user_id,
         Transaction.date < start_date,
         Transaction.type == 'income',
-        Transaction.is_planned == False
+        Transaction.is_planned.is_(False)
     ).scalar() or 0.0
 
     past_expenses = db.query(func.sum(Transaction.amount)).filter(
         Transaction.user_id == user_id,
         Transaction.date < start_date,
         Transaction.type == 'expense',
-        Transaction.is_planned == False
+        Transaction.is_planned.is_(False)
     ).scalar() or 0.0
 
     starting_balance = initial_balances + past_incomes - past_expenses
@@ -272,7 +274,7 @@ async def import_transactions(
             continue
 
         raw_str = f"{date_val}{amount_val}{desc_val}"
-        tx_hash = hashlib.md5(raw_str.encode('utf-8')).hexdigest()
+        tx_hash = hashlib.sha256(raw_str.encode('utf-8')).hexdigest()
 
         if db.query(Transaction).filter(Transaction.hash == tx_hash).first():
             skipped_count += 1
