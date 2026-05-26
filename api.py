@@ -96,7 +96,8 @@ def get_categories(user_id: int, db: Session = Depends(get_db)):
 
 @app.post("/categories", response_model=schemas.CategoryResponse, tags=["Категории"])
 def create_category(category: schemas.CategoryCreate, db: Session = Depends(get_db)):
-    """icon, color, sort_order - опционально"""
+    """icon, color, sort_order - опционально
+    * type: {expense, income}"""
     if category.sort_order == 0:
         max_sort = db.query(func.max(Category.sort_order)).filter(Category.user_id == category.user_id).scalar() or 0
         category.sort_order = max_sort + 1
@@ -277,7 +278,7 @@ def get_dashboard_data(user_id: int, start_week: str, end_week: str, db: Session
     """
     **Генерация данных для таблицы "Бюджет на год"**.
 
-    Главный эндпоинт приложения! Отдает готовую сетку:
+    Главный эндпоинт приложения. Отдает готовую сетку:
     * Считает `starting_balance` (накопительный баланс на начало `start_week`).
     * Раскладывает транзакции по категориям и неделям (ячейкам).
     * Выводит `transaction_id` в каждой ячейке.
@@ -380,6 +381,7 @@ def get_dashboard_data(user_id: int, start_week: str, end_week: str, db: Session
         "weekly_totals": weekly_totals
     }
 
+
 @app.post("/import", tags=["Импорт и Экспорт"])
 async def import_transactions(
         user_id: int,
@@ -388,12 +390,10 @@ async def import_transactions(
         db: Session = Depends(get_db)
 ):
     """
-    **Импорт из Excel**.
-
-    1. Читает файл (Ожидает колонки: Дата, Сумма, Описание).
-    2. Защищает от дублей (вычисляет SHA-256 хэш каждой строки).
-    3. Конвертирует точные даты в Недели.
-    4. **Агрегация:** Если на этой неделе уже была трата в этой категории, он просто приплюсует сумму к существующей ячейке.
+    **Умный импорт из Excel (Агрегация по неделям)**.
+    1. Читает файл (Дата, Сумма, Описание).
+    2. Распределяет по категориям, ища их названия в Описании.
+    3. Складывает все чеки одной категории внутри одной недели в единую ячейку.
     """
     contents = await file.read()
     try:
@@ -403,16 +403,26 @@ async def import_transactions(
 
     user_categories = db.query(Category).filter(Category.user_id == user_id).all()
 
+    max_sort = db.query(func.max(Category.sort_order)).filter(Category.user_id == user_id).scalar() or 0
 
-    default_cat = next((cat for cat in user_categories if cat.name == "Прочее"), None)
-    if not default_cat:
-        default_cat = Category(user_id=user_id, name="Прочее", type="expense")
-        db.add(default_cat)
-        db.commit()
-        db.refresh(default_cat)
+    default_expense = next((cat for cat in user_categories if cat.name == "Прочие расходы"), None)
+    if not default_expense:
+        max_sort += 1
+        default_expense = Category(user_id=user_id, name="Прочие расходы", type="expense", sort_order=max_sort)
+        db.add(default_expense)
+
+    default_income = next((cat for cat in user_categories if cat.name == "Прочие доходы"), None)
+    if not default_income:
+        max_sort += 1
+        default_income = Category(user_id=user_id, name="Прочие доходы", type="income", sort_order=max_sort)
+        db.add(default_income)
+
+    db.commit()
+    user_categories = db.query(Category).filter(Category.user_id == user_id).all()
 
     added_count = 0
     skipped_count = 0
+
     for index, row in df.iterrows():
         try:
             date_val = pd.to_datetime(row['Дата'], dayfirst=True).date()
@@ -421,32 +431,40 @@ async def import_transactions(
         except (KeyError, ValueError):
             continue
 
-        week_str, w_start, w_end = get_week_info(date_val)
+        week_str = date_val.strftime('%Y-%W')
 
         raw_str = f"{date_val}{amount_val}{desc_val}"
         tx_hash = hashlib.sha256(raw_str.encode('utf-8')).hexdigest()
-        if db.query(Transaction).filter(Transaction.hash == tx_hash).first():
+
+        if db.query(Transaction).filter(Transaction.hash.contains(tx_hash)).first():
             skipped_count += 1
             continue
 
-        assigned_category_id = default_cat.category_id
-
-        tx_type = "expense" if amount_val < 0 else "income"
         abs_amount = abs(amount_val)
+        is_expense = amount_val < 0
+
+        assigned_category_id = None
+        desc_lower = desc_val.lower()
+
+        for cat in user_categories:
+            if cat.name.lower() in desc_lower:
+                if (is_expense and cat.type == "expense") or (not is_expense and cat.type == "income"):
+                    assigned_category_id = cat.category_id
+                    break
+
+        if not assigned_category_id:
+            assigned_category_id = default_expense.category_id if is_expense else default_income.category_id
 
         existing_tx = db.query(Transaction).filter(
             Transaction.user_id == user_id,
             Transaction.category_id == assigned_category_id,
             Transaction.week == week_str,
-            Transaction.is_planned == False
+            Transaction.is_planned.is_(False)
         ).first()
 
         if existing_tx:
             existing_tx.amount += abs_amount
-            if existing_tx.hash:
-                existing_tx.hash += f",{tx_hash}"
-            else:
-                existing_tx.hash = tx_hash
+            existing_tx.hash += f",{tx_hash}" if existing_tx.hash else tx_hash
         else:
             new_tx = Transaction(
                 user_id=user_id,
@@ -454,7 +472,7 @@ async def import_transactions(
                 category_id=assigned_category_id,
                 amount=abs_amount,
                 week=week_str,
-                description=f"Импорт за {week_str}",
+                description=f"Сводка за {week_str}",
                 is_planned=False,
                 hash=tx_hash
             )
@@ -462,13 +480,12 @@ async def import_transactions(
 
         account = db.query(Account).filter(Account.account_id == account_id).first()
         if account:
-            if tx_type == "expense":
+            if is_expense:
                 account.balance -= abs_amount
             else:
                 account.balance += abs_amount
 
         added_count += 1
-
 
     db.commit()
     return {"message": "Успешно", "added": added_count, "skipped": skipped_count}
@@ -636,7 +653,7 @@ def discard_sandbox():
 
 @app.post("/sandbox/apply", tags=["Моделирование"])
 def apply_sandbox():
-    """Сохраняет смоделированный сценарий в реальную жизнь"""
+    """Сохраняет смоделированный сценарий в основную бд"""
     global SANDBOX_MODE
     if not SANDBOX_MODE:
         raise HTTPException(status_code=400, detail="Песочница не запущена")
