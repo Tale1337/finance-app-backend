@@ -96,12 +96,10 @@ class RecurringTransaction(Base):
     account_id = Column(Integer, ForeignKey("accounts.account_id"))
     category_id = Column(Integer, ForeignKey("categories.category_id"))
     amount = Column(Float, nullable=False)
-    type = Column(String, nullable=False)
     start_week = Column(String, nullable=False)
     end_week = Column(String, nullable=True)
     next_sync_week = Column(String, nullable=True)
-
-    is_active = Column(Boolean, default=True)
+    is_planned = Column(Boolean, default=False)
 
 
 class Transaction(Base):
@@ -111,7 +109,6 @@ class Transaction(Base):
     account_id = Column(Integer, ForeignKey("accounts.account_id"))
     category_id = Column(Integer, ForeignKey("categories.category_id"))
     amount = Column(Float, nullable=False)
-    type = Column(String, nullable=False)
     week = Column(String, nullable=False)
     description = Column(String, nullable=True)
     is_planned = Column(Boolean, default=False)

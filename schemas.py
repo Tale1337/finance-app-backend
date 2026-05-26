@@ -70,10 +70,18 @@ class TransactionCreate(BaseModel):
     account_id: int
     category_id: int
     amount: float
-    type: str
     week: str
     description: Optional[str] = None
     is_planned: bool = False
+
+
+class TransactionUpdate(BaseModel):
+    account_id: Optional[int] = None
+    category_id: Optional[int] = None
+    amount: Optional[float] = None
+    week: Optional[str] = None
+    description: Optional[str] = None
+    is_planned: Optional[bool] = None
 
 
 class TransactionResponse(BaseModel):
@@ -82,7 +90,6 @@ class TransactionResponse(BaseModel):
     account_id: int
     category_id: int
     amount: float
-    type: str
     week: str
     description: Optional[str]
     is_planned: bool
@@ -103,10 +110,9 @@ class RecurringCreate(BaseModel):
     account_id: int
     category_id: int
     amount: float
-    type: str
     start_week: str
     end_week: Optional[str] = None
-    is_active: bool = True
+    is_planned: bool = False
 
 
 class RecurringUpdate(BaseModel):
@@ -114,7 +120,7 @@ class RecurringUpdate(BaseModel):
     category_id: Optional[int] = None
     amount: Optional[float] = None
     end_week: Optional[str] = None
-    is_active: Optional[bool] = None
+    is_planned: Optional[bool] = None
 
 
 class RecurringResponse(RecurringCreate):

@@ -96,6 +96,7 @@ def get_categories(user_id: int, db: Session = Depends(get_db)):
 
 @app.post("/categories", response_model=schemas.CategoryResponse, tags=["Категории"])
 def create_category(category: schemas.CategoryCreate, db: Session = Depends(get_db)):
+    """icon, color, sort_order - опционально"""
     if category.sort_order == 0:
         max_sort = db.query(func.max(Category.sort_order)).filter(Category.user_id == category.user_id).scalar() or 0
         category.sort_order = max_sort + 1
@@ -147,6 +148,7 @@ def get_accounts(user_id: int, db: Session = Depends(get_db)):
 
 @app.post("/accounts", response_model=schemas.AccountResponse, tags=["Счета"])
 def create_account(account: schemas.AccountCreate, db: Session = Depends(get_db)):
+    """type: {card, credit, deposit}"""
     new_account = Account(**account.model_dump())
     new_account.initial_balance = account.balance
     db.add(new_account)
@@ -188,22 +190,67 @@ def get_transactions(user_id: int, limit: int = 50, offset: int = 0, db: Session
 
 @app.post("/transactions", response_model=schemas.TransactionResponse, tags=["Транзакции"])
 def create_transaction(tx: schemas.TransactionCreate, db: Session = Depends(get_db)):
+    """
+    **Создание новой транзакции (План или Факт)**.
+
+    * Если `is_planned = False` (Факт): Бэкенд автоматически пересчитает баланс указанного счета.
+    * Если `is_planned = True` (План): Транзакция сохранится, но реальный баланс счета не изменится.
+    Неделю передавать в формате `YYYY-WW` (например, `2026-21`).
+    """
     account = db.query(Account).filter(Account.account_id == tx.account_id).first()
-    if not account:
-        raise HTTPException(status_code=404, detail="Счет не найден")
+    category = db.query(Category).filter(Category.category_id == tx.category_id).first()
+
+    if not account or not category:
+        raise HTTPException(status_code=404, detail="Счет или категория не найдены")
 
     new_tx = Transaction(**tx.model_dump())
     db.add(new_tx)
 
     if not tx.is_planned:
-        if tx.type == "expense":
+        if category.type == "expense":
             account.balance -= tx.amount
-        elif tx.type == "income":
+        elif category.type == "income":
             account.balance += tx.amount
 
     db.commit()
     db.refresh(new_tx)
     return new_tx
+
+
+@app.put("/transactions/{transaction_id}", response_model=schemas.TransactionResponse, tags=["Транзакции"])
+def update_transaction(transaction_id: int, tx_update: schemas.TransactionUpdate, db: Session = Depends(get_db)):
+    """
+    **Редактирование ячейки (транзакции)**.
+
+    Используется, когда пользователь меняет сумму прямо в таблице.
+    Бэкенд сам откатит старый баланс счета и применит новый.
+    """
+    tx = db.query(Transaction).filter(Transaction.transaction_id == transaction_id).first()
+    if not tx: raise HTTPException(status_code=404, detail="Транзакция не найдена")
+
+    account = db.query(Account).filter(Account.account_id == tx.account_id).first()
+    old_category = db.query(Category).filter(Category.category_id == tx.category_id).first()
+
+    if not tx.is_planned and account and old_category:
+        if old_category.type == "expense":
+            account.balance += tx.amount
+        elif old_category.type == "income":
+            account.balance -= tx.amount
+
+    update_data = tx_update.model_dump(exclude_unset=True)
+    for key, value in update_data.items():
+        setattr(tx, key, value)
+
+    new_category = db.query(Category).filter(Category.category_id == tx.category_id).first()
+    if not tx.is_planned and account and new_category:
+        if new_category.type == "expense":
+            account.balance -= tx.amount
+        elif new_category.type == "income":
+            account.balance += tx.amount
+
+    db.commit()
+    db.refresh(tx)
+    return tx
 
 
 @app.delete("/transactions/{transaction_id}", tags=["Транзакции"])
@@ -227,20 +274,29 @@ def delete_transaction(transaction_id: int, db: Session = Depends(get_db)):
 
 @app.get("/analytics/dashboard", tags=["Аналитика"])
 def get_dashboard_data(user_id: int, start_week: str, end_week: str, db: Session = Depends(get_db)):
+    """
+    **Генерация данных для таблицы "Бюджет на год"**.
+
+    Главный эндпоинт приложения! Отдает готовую сетку:
+    * Считает `starting_balance` (накопительный баланс на начало `start_week`).
+    * Раскладывает транзакции по категориям и неделям (ячейкам).
+    * Выводит `transaction_id` в каждой ячейке.
+    * Выводит итоги по каждой неделе.
+    """
     current_week = date.today().strftime('%Y-%W')
     initial_balances = db.query(func.sum(Account.initial_balance)).filter(Account.user_id == user_id).scalar() or 0.0
 
-    past_incomes = db.query(func.sum(Transaction.amount)).filter(
+    past_incomes = db.query(func.sum(Transaction.amount)).join(Category).filter(
         Transaction.user_id == user_id,
         Transaction.week < start_week,
-        Transaction.type == 'income',
+        Category.type == 'income',
         Transaction.is_planned.is_(False)
     ).scalar() or 0.0
 
-    past_expenses = db.query(func.sum(Transaction.amount)).filter(
+    past_expenses = db.query(func.sum(Transaction.amount)).join(Category).filter(
         Transaction.user_id == user_id,
         Transaction.week < start_week,
-        Transaction.type == 'expense',
+        Category.type == 'expense',
         Transaction.is_planned.is_(False)
     ).scalar() or 0.0
 
@@ -252,7 +308,8 @@ def get_dashboard_data(user_id: int, start_week: str, end_week: str, db: Session
         .filter(
             Transaction.user_id == user_id,
             Transaction.week >= start_week,
-            Transaction.week <= end_week
+            Transaction.week <= end_week,
+            Category.type != 'transfer'
         )
         .all()
     )
@@ -264,7 +321,10 @@ def get_dashboard_data(user_id: int, start_week: str, end_week: str, db: Session
         w = tx.week
 
         if w not in weekly_totals:
-            weekly_totals[w] = {"total_income": 0, "total_expense": 0, "balance": 0, "net_total": 0}
+            weekly_totals[w] = {
+                "fact": {"income": 0, "expense": 0, "net": 0, "balance": 0},
+                "plan": {"income": 0, "expense": 0, "net": 0, "balance": 0}
+            }
 
         if cat.name not in categories_data:
             categories_data[cat.name] = {
@@ -286,30 +346,38 @@ def get_dashboard_data(user_id: int, start_week: str, end_week: str, db: Session
 
         if tx.is_planned:
             categories_data[cat.name]["weeks"][w]["plan"] = cell_data
+            if cat.type == 'income':
+                weekly_totals[w]["plan"]["income"] += tx.amount
+            else:
+                weekly_totals[w]["plan"]["expense"] += tx.amount
         else:
             categories_data[cat.name]["weeks"][w]["fact"] = cell_data
-
             if cat.type == 'income':
-                weekly_totals[w]["total_income"] += tx.amount
+                weekly_totals[w]["fact"]["income"] += tx.amount
             else:
-                weekly_totals[w]["total_expense"] += tx.amount
+                weekly_totals[w]["fact"]["expense"] += tx.amount
 
-    # sorted_weeks = sorted(weekly_totals.keys())
-    # current_running_balance = starting_balance
+    sorted_weeks = sorted(weekly_totals.keys())
 
-    # for w in sorted_weeks:
-    #     inc = weekly_totals[w]["total_income"]
-    #     exp = weekly_totals[w]["total_expense"]
-    #     weekly_totals[w]["net_total"] = inc - exp
-    #     current_running_balance += inc
-    #     current_running_balance -= exp
-    #     weekly_totals[w]["balance"] = current_running_balance
+    current_fact_balance = starting_balance
+    current_plan_balance = starting_balance
+
+    for w in sorted_weeks:
+        f_net = weekly_totals[w]["fact"]["income"] - weekly_totals[w]["fact"]["expense"]
+        weekly_totals[w]["fact"]["net"] = f_net
+        current_fact_balance += f_net
+        weekly_totals[w]["fact"]["balance"] = current_fact_balance
+
+        p_net = weekly_totals[w]["plan"]["income"] - weekly_totals[w]["plan"]["expense"]
+        weekly_totals[w]["plan"]["net"] = p_net
+        current_plan_balance += p_net
+        weekly_totals[w]["plan"]["balance"] = current_plan_balance
 
     return {
         "current_week": current_week,
         "starting_balance": starting_balance,
-        "categories": categories_data
-        # "weekly_totals": weekly_totals
+        "categories": categories_data,
+        "weekly_totals": weekly_totals
     }
 
 @app.post("/import", tags=["Импорт и Экспорт"])
@@ -320,7 +388,12 @@ async def import_transactions(
         db: Session = Depends(get_db)
 ):
     """
-    Загрузка выписки из банка в формате Excel.
+    **Импорт из Excel**.
+
+    1. Читает файл (Ожидает колонки: Дата, Сумма, Описание).
+    2. Защищает от дублей (вычисляет SHA-256 хэш каждой строки).
+    3. Конвертирует точные даты в Недели.
+    4. **Агрегация:** Если на этой неделе уже была трата в этой категории, он просто приплюсует сумму к существующей ячейке.
     """
     contents = await file.read()
     try:
@@ -380,7 +453,6 @@ async def import_transactions(
                 account_id=account_id,
                 category_id=assigned_category_id,
                 amount=abs_amount,
-                type=tx_type,
                 week=week_str,
                 description=f"Импорт за {week_str}",
                 is_planned=False,
@@ -404,6 +476,13 @@ async def import_transactions(
 
 @app.get("/export/excel", tags=["Импорт и Экспорт"])
 def export_budget_to_excel(user_id: int, start_week: str, end_week: str, db: Session = Depends(get_db)):
+    """
+    **Экспорт бюджета в XLSX**.
+
+    Генерирует Excel-файл со сводной таблицей (Pivot Table).
+    Ряды: Категории, Колонки: Недели. Разделяет суммы на План и Факт.
+    Файл сразу отдается на скачивание.
+    """
     week_expr = Transaction.week.label('week')
     fact_sum = func.sum(case((Transaction.is_planned.is_(False), Transaction.amount), else_=0)).label('fact_amount')
     plan_sum = func.sum(case((Transaction.is_planned.is_(True), Transaction.amount), else_=0)).label('plan_amount')
@@ -448,18 +527,26 @@ def get_recurring(user_id: int, db: Session = Depends(get_db)):
 
 @app.post("/recurring", response_model=schemas.RecurringResponse, tags=["Повторяющиеся транзакции"])
 def create_recurring(recurring: schemas.RecurringCreate, db: Session = Depends(get_db)):
-    """Создать новую подписку (шаблон)"""
+    """
+    **Создание еженедельного автоплатежа**.
+
+    Создает шаблон. Деньги сразу не списываются.
+    Бэкенд сам будет проверять этот шаблон при каждом запуске приложения
+    и генерировать транзакции на нужные недели.
+    **end_week** - опционально
+    """
     new_rec = RecurringTransaction(**recurring.model_dump())
     new_rec.next_sync_week = new_rec.start_week
     db.add(new_rec)
     db.commit()
     db.refresh(new_rec)
+    process_recurring_transactions(db)
     return new_rec
 
 
 @app.put("/recurring/{recurring_id}", response_model=schemas.RecurringResponse, tags=["Повторяющиеся транзакции"])
 def update_recurring(recurring_id: int, rec_update: schemas.RecurringUpdate, db: Session = Depends(get_db)):
-    """Включить/выключить или изменить подписку"""
+    """Изменение автоплатежа"""
     db_rec = db.query(RecurringTransaction).filter(RecurringTransaction.recurring_id == recurring_id).first()
     if not db_rec:
         raise HTTPException(status_code=404, detail="Шаблон не найден")
@@ -470,12 +557,14 @@ def update_recurring(recurring_id: int, rec_update: schemas.RecurringUpdate, db:
 
     db.commit()
     db.refresh(db_rec)
+
+    process_recurring_transactions(db)
     return db_rec
 
 
 @app.delete("/recurring/{recurring_id}", tags=["Повторяющиеся транзакции"])
 def delete_recurring(recurring_id: int, db: Session = Depends(get_db)):
-    """Удалить подписку насовсем"""
+    """Удалить подписку"""
     db_rec = db.query(RecurringTransaction).filter(RecurringTransaction.recurring_id == recurring_id).first()
     if not db_rec:
         raise HTTPException(status_code=404, detail="Шаблон не найден")
@@ -485,10 +574,12 @@ def delete_recurring(recurring_id: int, db: Session = Depends(get_db)):
 
 
 def process_recurring_transactions(db: Session):
+    """
+    Проверяет даты и списывает деньги за прошедшие периоды.
+    """
     current_week = date.today().strftime('%Y-%W')
 
     active_subs = db.query(RecurringTransaction).filter(
-        RecurringTransaction.is_active == True,
         RecurringTransaction.next_sync_week <= current_week
     ).all()
 
@@ -497,7 +588,7 @@ def process_recurring_transactions(db: Session):
         while sub.next_sync_week <= current_week:
 
             if sub.end_week and sub.next_sync_week > sub.end_week:
-                sub.is_active = False
+                db.delete(sub)
                 break
 
             new_tx = Transaction(
@@ -505,28 +596,25 @@ def process_recurring_transactions(db: Session):
                 account_id=sub.account_id,
                 category_id=sub.category_id,
                 amount=sub.amount,
-                type=sub.type,
                 week=sub.next_sync_week,
-                description="Еженедельный автоплатеж",
-                is_planned=False,
+                description="Автоплатеж",
+                is_planned=sub.is_planned,
                 is_recurring=True
             )
             db.add(new_tx)
 
-            account = db.query(Account).filter(Account.account_id == sub.account_id).first()
-            if account:
-                if sub.type == "expense":
-                    account.balance -= sub.amount
-                elif sub.type == "income":
-                    account.balance += sub.amount
+            if not sub.is_planned:
+                account = db.query(Account).filter(Account.account_id == sub.account_id).first()
+                cat = db.query(Category).filter(Category.category_id == sub.category_id).first()
+                if account and cat:
+                    if cat.type == "expense": account.balance -= sub.amount
+                    elif cat.type == "income": account.balance += sub.amount
 
             sub.next_sync_week = add_one_week(sub.next_sync_week)
             generated_count += 1
 
     db.commit()
-    if generated_count > 0:
-        print(f"Синхронизация: сгенерировано {generated_count} автоплатежей.")
-
+    return generated_count
 
 
 @app.post("/sandbox/start", tags=["Моделирование"])
@@ -560,7 +648,11 @@ def apply_sandbox():
 
 @app.post("/transfer", tags=["Транзакции"])
 def create_transfer(transfer: schemas.TransferCreate, db: Session = Depends(get_db)):
-    """Перевод денег со счета на счет (Кредиты, Копилки и т.д.)"""
+    """
+    **Перевод между счетами (Погашение кредиток, Копилки)**.
+
+    Списывает деньги с `from_account_id` и зачисляет на `to_account_id`.
+    """
 
     if transfer.from_account_id == transfer.to_account_id:
         raise HTTPException(status_code=400, detail="Нельзя перевести на тот же самый счет")
@@ -584,7 +676,6 @@ def create_transfer(transfer: schemas.TransferCreate, db: Session = Depends(get_
         account_id=transfer.from_account_id,
         category_id=sys_cat.category_id,
         amount=transfer.amount,
-        type="transfer",
         week=transfer.week,
         description=transfer.description,
         is_planned=False
@@ -596,7 +687,6 @@ def create_transfer(transfer: schemas.TransferCreate, db: Session = Depends(get_
         account_id=transfer.to_account_id,
         category_id=sys_cat.category_id,
         amount=transfer.amount,
-        type="transfer",
         week=transfer.week,
         description=transfer.description,
         is_planned=False
