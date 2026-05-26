@@ -2,20 +2,31 @@ import hashlib
 import io
 import pandas as pd
 import schemas
+import shutil
 from contextlib import asynccontextmanager
-from database import SessionLocal, init_db, User, Category, Account, Transaction
-from datetime import date
+from database import SessionLocal, SandboxSessionLocal, db_path, sandbox_path, init_db, User, Category, Account, Transaction, Budget, RecurringTransaction
+from datetime import date, datetime, timedelta
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
-from sqlalchemy import func, case, or_
+from sqlalchemy import func, case
 from typing import List
+from dateutil.relativedelta import relativedelta
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+
+    db = SessionLocal()
+    try:
+        process_recurring_transactions(db)
+    except Exception as e:
+        print(f"Ошибка при синхронизации подписок: {e}")
+    finally:
+        db.close()
+
     yield
 
 
@@ -28,12 +39,37 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+SANDBOX_MODE = False
+
+
 def get_db():
-    db = SessionLocal()
+    """Отдает правильную базу в зависимости от режима"""
+    global SANDBOX_MODE
+
+    if SANDBOX_MODE:
+        db = SandboxSessionLocal()
+    else:
+        db = SessionLocal()
+
     try:
         yield db
     finally:
         db.close()
+
+
+def get_week_info(target_date):
+    """Превращает любую дату в данные о неделе"""
+    start_of_week = target_date - timedelta(days=target_date.weekday())
+    end_of_week = start_of_week + timedelta(days=6)
+    week_number = start_of_week.strftime('%Y-%W')
+    return week_number, start_of_week, end_of_week
+
+
+def add_one_week(week_str: str) -> str:
+    """Прибавляет 1 неделю к строке вида '2026-21'"""
+    dt = datetime.strptime(week_str + '-1', "%Y-%W-%w")
+    next_dt = dt + timedelta(days=7)
+    return next_dt.strftime('%Y-%W')
 
 
 @app.get("/users", response_model=List[schemas.UserResponse], tags=["Пользователи"])
@@ -70,6 +106,39 @@ def create_category(category: schemas.CategoryCreate, db: Session = Depends(get_
     db.refresh(new_category)
     return new_category
 
+@app.put("/categories/{category_id}", response_model=schemas.CategoryResponse, tags=["Категории"])
+def update_category(category_id: int, cat_update: schemas.CategoryUpdate, db: Session = Depends(get_db)):
+    db_cat = db.query(Category).filter(Category.category_id == category_id).first()
+    if not db_cat:
+        raise HTTPException(status_code=404, detail="Категория не найдена")
+
+    update_data = cat_update.model_dump(exclude_unset=True)
+    for key, value in update_data.items():
+        setattr(db_cat, key, value)
+
+    db.commit()
+    db.refresh(db_cat)
+    return db_cat
+
+@app.delete("/categories/{category_id}", tags=["Категории"])
+def delete_category(category_id: int, user_id: int, db: Session = Depends(get_db)):
+    db_cat = db.query(Category).filter(Category.category_id == category_id).first()
+    if not db_cat:
+        raise HTTPException(status_code=404, detail="Категория не найдена")
+
+    default_cat = db.query(Category).filter(Category.name == "Прочее", Category.user_id == user_id).first()
+    if not default_cat:
+        default_cat = Category(user_id=user_id, name="Прочее", type="expense")
+        db.add(default_cat)
+        db.commit()
+        db.refresh(default_cat)
+
+    db.query(Transaction).filter(Transaction.category_id == category_id).update({"category_id": default_cat.category_id})
+
+    db.delete(db_cat)
+    db.commit()
+    return {"message": "Категория удалена, старые транзакции перенесены в 'Прочее'"}
+
 
 @app.get("/accounts", response_model=List[schemas.AccountResponse], tags=["Счета"])
 def get_accounts(user_id: int, db: Session = Depends(get_db)):
@@ -84,6 +153,32 @@ def create_account(account: schemas.AccountCreate, db: Session = Depends(get_db)
     db.commit()
     db.refresh(new_account)
     return new_account
+
+
+@app.put("/accounts/{account_id}", response_model=schemas.AccountResponse, tags=["Счета"])
+def update_account(account_id: int, account_update: schemas.AccountUpdate, db: Session = Depends(get_db)):
+    db_account = db.query(Account).filter(Account.account_id == account_id).first()
+    if not db_account:
+        raise HTTPException(status_code=404, detail="Счет не найден")
+
+    update_data = account_update.model_dump(exclude_unset=True)
+    for key, value in update_data.items():
+        setattr(db_account, key, value)
+
+    db.commit()
+    db.refresh(db_account)
+    return db_account
+
+
+@app.delete("/accounts/{account_id}", tags=["Счета"])
+def delete_account(account_id: int, db: Session = Depends(get_db)):
+    db_account = db.query(Account).filter(Account.account_id == account_id).first()
+    if not db_account:
+        raise HTTPException(status_code=404, detail="Счет не найден")
+
+    db_account.is_active = False
+    db.commit()
+    return {"message": "Счет перенесен в архив"}
 
 
 @app.get("/transactions", response_model=List[schemas.TransactionResponse], tags=["Транзакции"])
@@ -131,109 +226,90 @@ def delete_transaction(transaction_id: int, db: Session = Depends(get_db)):
 
 
 @app.get("/analytics/dashboard", tags=["Аналитика"])
-def get_dashboard_data(
-        user_id: int,
-        start_date: date,
-        end_date: date,
-        db: Session = Depends(get_db)
-):
-    """
-    Возвращает полностью готовые данные для отрисовки сетки 'Бюджет на год'.
-    """
+def get_dashboard_data(user_id: int, start_week: str, end_week: str, db: Session = Depends(get_db)):
     current_week = date.today().strftime('%Y-%W')
-
     initial_balances = db.query(func.sum(Account.initial_balance)).filter(Account.user_id == user_id).scalar() or 0.0
 
     past_incomes = db.query(func.sum(Transaction.amount)).filter(
         Transaction.user_id == user_id,
-        Transaction.date < start_date,
+        Transaction.week < start_week,
         Transaction.type == 'income',
         Transaction.is_planned.is_(False)
     ).scalar() or 0.0
 
     past_expenses = db.query(func.sum(Transaction.amount)).filter(
         Transaction.user_id == user_id,
-        Transaction.date < start_date,
+        Transaction.week < start_week,
         Transaction.type == 'expense',
         Transaction.is_planned.is_(False)
     ).scalar() or 0.0
 
     starting_balance = initial_balances + past_incomes - past_expenses
 
-    week_expr = func.strftime('%Y-%W', Transaction.date).label('week')
-
-    fact_exp = func.sum(case((Transaction.is_planned == False, Transaction.amount), else_=0)).label('fact_exp')
-    plan_exp = func.sum(case((Transaction.is_planned == True, Transaction.amount), else_=0)).label('plan_exp')
-
-    query = (
-        db.query(
-            week_expr,
-            Category.name.label('cat_name'),
-            Category.type.label('cat_type'),
-            Category.color.label('cat_color'),
-            Category.icon.label('cat_icon'),
-            Category.sort_order.label('cat_sort'),
-            fact_exp,
-            plan_exp
-        )
+    transactions = (
+        db.query(Transaction, Category)
         .join(Category, Transaction.category_id == Category.category_id)
         .filter(
             Transaction.user_id == user_id,
-            Transaction.date >= start_date,
-            Transaction.date <= end_date
+            Transaction.week >= start_week,
+            Transaction.week <= end_week
         )
-        .group_by(week_expr, Category.name, Category.type)
         .all()
     )
 
     categories_data = {}
     weekly_totals = {}
 
-    for row in query:
-        w = row.week
-        cat = row.cat_name
-        c_type = row.cat_type
+    for tx, cat in transactions:
+        w = tx.week
 
         if w not in weekly_totals:
-            weekly_totals[w] = {"total_income": 0, "total_expense": 0, "balance": 0}
+            weekly_totals[w] = {"total_income": 0, "total_expense": 0, "balance": 0, "net_total": 0}
 
-        if cat not in categories_data:
-            categories_data[cat] = {
-                "type": row.cat_type,
-                "color": row.cat_color,
-                "icon": row.cat_icon,
-                "sort_order": row.cat_sort,
+        if cat.name not in categories_data:
+            categories_data[cat.name] = {
+                "category_id": cat.category_id,
+                "type": cat.type,
+                "color": cat.color,
+                "icon": cat.icon,
+                "sort_order": cat.sort_order,
                 "weeks": {}
             }
 
-        categories_data[cat]["weeks"][w] = {
-            "plan": row.plan_exp,
-            "fact": row.fact_exp
+        if w not in categories_data[cat.name]["weeks"]:
+            categories_data[cat.name]["weeks"][w] = {"plan": None, "fact": None}
+
+        cell_data = {
+            "transaction_id": tx.transaction_id,
+            "amount": tx.amount
         }
 
-        if c_type == 'income':
-            weekly_totals[w]["total_income"] += row.fact_exp
+        if tx.is_planned:
+            categories_data[cat.name]["weeks"][w]["plan"] = cell_data
         else:
-            weekly_totals[w]["total_expense"] += row.fact_exp
+            categories_data[cat.name]["weeks"][w]["fact"] = cell_data
 
-    sorted_weeks = sorted(weekly_totals.keys())
-    current_running_balance = starting_balance
+            if cat.type == 'income':
+                weekly_totals[w]["total_income"] += tx.amount
+            else:
+                weekly_totals[w]["total_expense"] += tx.amount
 
-    for w in sorted_weeks:
-        inc = weekly_totals[w]["total_income"]
-        exp = weekly_totals[w]["total_expense"]
+    # sorted_weeks = sorted(weekly_totals.keys())
+    # current_running_balance = starting_balance
 
-        weekly_totals[w]["net_total"] = inc - exp
-
-        current_running_balance += inc
-        current_running_balance -= exp
-        weekly_totals[w]["balance"] = current_running_balance
+    # for w in sorted_weeks:
+    #     inc = weekly_totals[w]["total_income"]
+    #     exp = weekly_totals[w]["total_expense"]
+    #     weekly_totals[w]["net_total"] = inc - exp
+    #     current_running_balance += inc
+    #     current_running_balance -= exp
+    #     weekly_totals[w]["balance"] = current_running_balance
 
     return {
         "current_week": current_week,
-        # "starting_balance": starting_balance,
-        "categories": categories_data,
-        "weekly_totals": weekly_totals
+        "starting_balance": starting_balance,
+        "categories": categories_data
+        # "weekly_totals": weekly_totals
     }
 
 @app.post("/import", tags=["Импорт и Экспорт"])
@@ -264,7 +340,6 @@ async def import_transactions(
 
     added_count = 0
     skipped_count = 0
-
     for index, row in df.iterrows():
         try:
             date_val = pd.to_datetime(row['Дата'], dayfirst=True).date()
@@ -273,55 +348,75 @@ async def import_transactions(
         except (KeyError, ValueError):
             continue
 
+        week_str, w_start, w_end = get_week_info(date_val)
+
         raw_str = f"{date_val}{amount_val}{desc_val}"
         tx_hash = hashlib.sha256(raw_str.encode('utf-8')).hexdigest()
-
         if db.query(Transaction).filter(Transaction.hash == tx_hash).first():
             skipped_count += 1
             continue
 
         assigned_category_id = default_cat.category_id
-        desc_lower = desc_val.lower()
-
-        for category in user_categories:
-            if category.name.lower() in desc_lower:
-                assigned_category_id = category.category_id
-                break
-
 
         tx_type = "expense" if amount_val < 0 else "income"
+        abs_amount = abs(amount_val)
 
-        new_tx = Transaction(
-            user_id=user_id,
-            account_id=account_id,
-            category_id=assigned_category_id,
-            amount=abs(amount_val),
-            type=tx_type,
-            date=date_val,
-            description=desc_val,
-            is_planned=False,
-            hash=tx_hash
-        )
-        db.add(new_tx)
+        existing_tx = db.query(Transaction).filter(
+            Transaction.user_id == user_id,
+            Transaction.category_id == assigned_category_id,
+            Transaction.week == week_str,
+            Transaction.is_planned == False
+        ).first()
+
+        if existing_tx:
+            existing_tx.amount += abs_amount
+            if existing_tx.hash:
+                existing_tx.hash += f",{tx_hash}"
+            else:
+                existing_tx.hash = tx_hash
+        else:
+            new_tx = Transaction(
+                user_id=user_id,
+                account_id=account_id,
+                category_id=assigned_category_id,
+                amount=abs_amount,
+                type=tx_type,
+                week=week_str,
+                description=f"Импорт за {week_str}",
+                is_planned=False,
+                hash=tx_hash
+            )
+            db.add(new_tx)
+
+        account = db.query(Account).filter(Account.account_id == account_id).first()
+        if account:
+            if tx_type == "expense":
+                account.balance -= abs_amount
+            else:
+                account.balance += abs_amount
+
         added_count += 1
+
 
     db.commit()
     return {"message": "Успешно", "added": added_count, "skipped": skipped_count}
 
 
 @app.get("/export/excel", tags=["Импорт и Экспорт"])
-def export_budget_to_excel(user_id: int, start_date: date, end_date: date, db: Session = Depends(get_db)):
-    week_expr = func.strftime('%Y-%W', Transaction.date).label('week')
-    fact_sum = func.sum(case((Transaction.is_planned == False, Transaction.amount), else_=0)).label('fact_amount')
-    plan_sum = func.sum(case((Transaction.is_planned == True, Transaction.amount), else_=0)).label('plan_amount')
+def export_budget_to_excel(user_id: int, start_week: str, end_week: str, db: Session = Depends(get_db)):
+    week_expr = Transaction.week.label('week')
+    fact_sum = func.sum(case((Transaction.is_planned.is_(False), Transaction.amount), else_=0)).label('fact_amount')
+    plan_sum = func.sum(case((Transaction.is_planned.is_(True), Transaction.amount), else_=0)).label('plan_amount')
 
     query = (
         db.query(week_expr, Category.name.label('category_name'), fact_sum, plan_sum)
         .join(Category, Transaction.category_id == Category.category_id)
         .filter(
-            Transaction.user_id == user_id, Transaction.date >= start_date, Transaction.date <= end_date
+            Transaction.user_id == user_id,
+            Transaction.week >= start_week,
+            Transaction.week <= end_week
         )
-        .group_by(week_expr, Category.name).all()
+        .group_by(Transaction.week, Category.name).all()
     )
 
     if not query:
@@ -340,6 +435,176 @@ def export_budget_to_excel(user_id: int, start_date: date, end_date: date, db: S
 
     return StreamingResponse(
         output,
-        headers={'Content-Disposition': f'attachment; filename="budget_{start_date}_{end_date}.xlsx"'},
+        headers={'Content-Disposition': f'attachment; filename="budget_{start_week}_{end_week}.xlsx"'},
         media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
     )
+
+
+@app.get("/recurring", response_model=List[schemas.RecurringResponse], tags=["Повторяющиеся транзакции"])
+def get_recurring(user_id: int, db: Session = Depends(get_db)):
+    """Получить все подписки пользователя"""
+    return db.query(RecurringTransaction).filter(RecurringTransaction.user_id == user_id).all()
+
+
+@app.post("/recurring", response_model=schemas.RecurringResponse, tags=["Повторяющиеся транзакции"])
+def create_recurring(recurring: schemas.RecurringCreate, db: Session = Depends(get_db)):
+    """Создать новую подписку (шаблон)"""
+    new_rec = RecurringTransaction(**recurring.model_dump())
+    new_rec.next_sync_week = new_rec.start_week
+    db.add(new_rec)
+    db.commit()
+    db.refresh(new_rec)
+    return new_rec
+
+
+@app.put("/recurring/{recurring_id}", response_model=schemas.RecurringResponse, tags=["Повторяющиеся транзакции"])
+def update_recurring(recurring_id: int, rec_update: schemas.RecurringUpdate, db: Session = Depends(get_db)):
+    """Включить/выключить или изменить подписку"""
+    db_rec = db.query(RecurringTransaction).filter(RecurringTransaction.recurring_id == recurring_id).first()
+    if not db_rec:
+        raise HTTPException(status_code=404, detail="Шаблон не найден")
+
+    update_data = rec_update.model_dump(exclude_unset=True)
+    for key, value in update_data.items():
+        setattr(db_rec, key, value)
+
+    db.commit()
+    db.refresh(db_rec)
+    return db_rec
+
+
+@app.delete("/recurring/{recurring_id}", tags=["Повторяющиеся транзакции"])
+def delete_recurring(recurring_id: int, db: Session = Depends(get_db)):
+    """Удалить подписку насовсем"""
+    db_rec = db.query(RecurringTransaction).filter(RecurringTransaction.recurring_id == recurring_id).first()
+    if not db_rec:
+        raise HTTPException(status_code=404, detail="Шаблон не найден")
+    db.delete(db_rec)
+    db.commit()
+    return {"message": "Подписка удалена"}
+
+
+def process_recurring_transactions(db: Session):
+    current_week = date.today().strftime('%Y-%W')
+
+    active_subs = db.query(RecurringTransaction).filter(
+        RecurringTransaction.is_active == True,
+        RecurringTransaction.next_sync_week <= current_week
+    ).all()
+
+    generated_count = 0
+    for sub in active_subs:
+        while sub.next_sync_week <= current_week:
+
+            if sub.end_week and sub.next_sync_week > sub.end_week:
+                sub.is_active = False
+                break
+
+            new_tx = Transaction(
+                user_id=sub.user_id,
+                account_id=sub.account_id,
+                category_id=sub.category_id,
+                amount=sub.amount,
+                type=sub.type,
+                week=sub.next_sync_week,
+                description="Еженедельный автоплатеж",
+                is_planned=False,
+                is_recurring=True
+            )
+            db.add(new_tx)
+
+            account = db.query(Account).filter(Account.account_id == sub.account_id).first()
+            if account:
+                if sub.type == "expense":
+                    account.balance -= sub.amount
+                elif sub.type == "income":
+                    account.balance += sub.amount
+
+            sub.next_sync_week = add_one_week(sub.next_sync_week)
+            generated_count += 1
+
+    db.commit()
+    if generated_count > 0:
+        print(f"Синхронизация: сгенерировано {generated_count} автоплатежей.")
+
+
+
+@app.post("/sandbox/start", tags=["Моделирование"])
+def start_sandbox():
+    """Активирует режим моделирования: создает точную копию БД"""
+    global SANDBOX_MODE
+    shutil.copy2(db_path, sandbox_path)
+    SANDBOX_MODE = True
+    return {"message": "Режим моделирования включен. Теперь вы работаете с копией."}
+
+
+@app.post("/sandbox/discard", tags=["Моделирование"])
+def discard_sandbox():
+    """Отменяет все изменения и возвращает к реальной БД"""
+    global SANDBOX_MODE
+    SANDBOX_MODE = False
+    return {"message": "Изменения сброшены. Возврат к основной базе."}
+
+
+@app.post("/sandbox/apply", tags=["Моделирование"])
+def apply_sandbox():
+    """Сохраняет смоделированный сценарий в реальную жизнь"""
+    global SANDBOX_MODE
+    if not SANDBOX_MODE:
+        raise HTTPException(status_code=400, detail="Песочница не запущена")
+
+    shutil.copy2(sandbox_path, db_path)
+    SANDBOX_MODE = False
+    return {"message": "Сценарий успешно применен и сохранен в основную базу!"}
+
+
+@app.post("/transfer", tags=["Транзакции"])
+def create_transfer(transfer: schemas.TransferCreate, db: Session = Depends(get_db)):
+    """Перевод денег со счета на счет (Кредиты, Копилки и т.д.)"""
+
+    if transfer.from_account_id == transfer.to_account_id:
+        raise HTTPException(status_code=400, detail="Нельзя перевести на тот же самый счет")
+
+    from_account = db.query(Account).filter(Account.account_id == transfer.from_account_id).first()
+    to_account = db.query(Account).filter(Account.account_id == transfer.to_account_id).first()
+
+    if not from_account or not to_account:
+        raise HTTPException(status_code=404, detail="Один из счетов не найден")
+
+    sys_cat = db.query(Category).filter(Category.name == "Переводы").first()
+    if not sys_cat:
+        max_sort = db.query(func.max(Category.sort_order)).filter(Category.user_id == transfer.user_id).scalar() or 0
+        sys_cat = Category(user_id=transfer.user_id, name="Переводы", type="transfer", sort_order=max_sort + 1)
+        db.add(sys_cat)
+        db.commit()
+        db.refresh(sys_cat)
+
+    tx_out = Transaction(
+        user_id=transfer.user_id,
+        account_id=transfer.from_account_id,
+        category_id=sys_cat.category_id,
+        amount=transfer.amount,
+        type="transfer",
+        week=transfer.week,
+        description=transfer.description,
+        is_planned=False
+    )
+    from_account.balance -= transfer.amount
+
+    tx_in = Transaction(
+        user_id=transfer.user_id,
+        account_id=transfer.to_account_id,
+        category_id=sys_cat.category_id,
+        amount=transfer.amount,
+        type="transfer",
+        week=transfer.week,
+        description=transfer.description,
+        is_planned=False
+    )
+    to_account.balance += transfer.amount
+
+    db.add(tx_out)
+    db.add(tx_in)
+    db.commit()
+
+    return {"message": "Перевод успешно выполнен"}

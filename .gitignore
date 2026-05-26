@@ -1,4 +1,4 @@
-database.sqlite
+*.sqlite
 *.db
 *.sqlite3
 *.xlsx

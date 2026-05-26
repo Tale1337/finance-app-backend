@@ -6,9 +6,14 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 
 BASE_DIR = Path(__file__).resolve().parent
 db_path = BASE_DIR / "database.sqlite"
+sandbox_path = BASE_DIR / "sandbox.sqlite"
 
 engine = create_engine(f"sqlite:///{db_path}", echo=False, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+sandbox_engine = create_engine(f"sqlite:///{sandbox_path}", echo=False, connect_args={"check_same_thread": False})
+SandboxSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=sandbox_engine)
+
 Base = declarative_base()
 
 
@@ -17,12 +22,14 @@ class User(Base):
     user_id = Column(Integer, primary_key=True, index=True)
     name = Column(String, nullable=False)
 
+
 class Setting(Base):
     __tablename__ = "settings"
     setting_id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.user_id"))
     key = Column(String, nullable=False)
     value = Column(JSON, nullable=True)
+
 
 class Notification(Base):
     __tablename__ = "notifications"
@@ -31,6 +38,7 @@ class Notification(Base):
     type = Column(String, nullable=False)
     title = Column(String, nullable=False)
     message = Column(String, nullable=False)
+
 
 class Deposit(Base):
     __tablename__ = "deposits"
@@ -45,6 +53,7 @@ class Deposit(Base):
     end_date = Column(Date, nullable=True)
     is_active = Column(Boolean, default=True)
 
+
 class Account(Base):
     __tablename__ = "accounts"
     account_id = Column(Integer, primary_key=True, index=True)
@@ -54,6 +63,7 @@ class Account(Base):
     balance = Column(Float, default=0.0)
     initial_balance = Column(Float, default=0.0)
     is_active = Column(Boolean, default=True)
+
 
 class Category(Base):
     __tablename__ = "categories"
@@ -66,6 +76,7 @@ class Category(Base):
     budget_limit = Column(Float, nullable=True)
     sort_order = Column(Integer, default=0)
 
+
 class Budget(Base):
     __tablename__ = "budgets"
     budget_id = Column(Integer, primary_key=True, index=True)
@@ -77,6 +88,7 @@ class Budget(Base):
     planned_amount = Column(Float, default=0.0)
     actual_amount = Column(Float, default=0.0)
 
+
 class RecurringTransaction(Base):
     __tablename__ = "recurring_transactions"
     recurring_id = Column(Integer, primary_key=True, index=True)
@@ -85,10 +97,12 @@ class RecurringTransaction(Base):
     category_id = Column(Integer, ForeignKey("categories.category_id"))
     amount = Column(Float, nullable=False)
     type = Column(String, nullable=False)
-    interval = Column(String, nullable=False)
-    start_date = Column(Date, nullable=False)
-    end_date = Column(Date, nullable=True)
+    start_week = Column(String, nullable=False)
+    end_week = Column(String, nullable=True)
+    next_sync_week = Column(String, nullable=True)
+
     is_active = Column(Boolean, default=True)
+
 
 class Transaction(Base):
     __tablename__ = "transactions"
@@ -98,7 +112,7 @@ class Transaction(Base):
     category_id = Column(Integer, ForeignKey("categories.category_id"))
     amount = Column(Float, nullable=False)
     type = Column(String, nullable=False)
-    date = Column(Date, nullable=False)
+    week = Column(String, nullable=False)
     description = Column(String, nullable=True)
     is_planned = Column(Boolean, default=False)
     is_recurring = Column(Boolean, default=False)
