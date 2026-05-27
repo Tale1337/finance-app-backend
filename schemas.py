@@ -138,4 +138,3 @@ class TransferCreate(BaseModel):
     amount: float
     week: str
     description: Optional[str] = "Перевод между счетами"
-    

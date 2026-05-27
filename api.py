@@ -256,17 +256,23 @@ def update_transaction(transaction_id: int, tx_update: schemas.TransactionUpdate
 
 @app.delete("/transactions/{transaction_id}", tags=["Транзакции"])
 def delete_transaction(transaction_id: int, db: Session = Depends(get_db)):
+    """
+    **Удаление транзакции**.
+    Бэкенд сам откатит баланс счета (вернет деньги), если это был Факт.
+    """
     tx = db.query(Transaction).filter(Transaction.transaction_id == transaction_id).first()
     if not tx:
         raise HTTPException(status_code=404, detail="Транзакция не найдена")
 
-    if not tx.is_planned:
-        account = db.query(Account).filter(Account.account_id == tx.account_id).first()
-        if account:
-            if tx.type == "expense":
-                account.balance += tx.amount
-            elif tx.type == "income":
-                account.balance -= tx.amount
+    account = db.query(Account).filter(Account.account_id == tx.account_id).first()
+
+    category = db.query(Category).filter(Category.category_id == tx.category_id).first()
+
+    if not tx.is_planned and account and category:
+        if category.type == "expense":
+            account.balance += tx.amount
+        elif category.type == "income":
+            account.balance -= tx.amount
 
     db.delete(tx)
     db.commit()
